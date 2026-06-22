@@ -6,13 +6,16 @@ type CloseHandler = () => void;
 
 export class WebSocketConnection {
   private buffer = Buffer.alloc(0);
+  private fragmentedOpcode: number | null = null;
+  private fragmentedPayloads: any[] = [];
+  private isClosed = false;
   private messageHandlers: MessageHandler[] = [];
   private closeHandlers: CloseHandler[] = [];
 
   constructor(private socket: any) {
     socket.on("data", (chunk: any) => this.handleData(chunk));
-    socket.on("close", () => this.closeHandlers.forEach((fn) => fn()));
-    socket.on("error", () => this.closeHandlers.forEach((fn) => fn()));
+    socket.on("close", () => this.notifyClose());
+    socket.on("error", () => this.notifyClose());
   }
 
   onMessage(handler: MessageHandler): void {
@@ -25,7 +28,12 @@ export class WebSocketConnection {
 
   sendText(text: string): void {
     const payload = Buffer.from(text, "utf8");
-    const header = this.makeHeader(payload.length);
+    const header = this.makeHeader(payload.length, 0x1);
+    this.socket.write(Buffer.concat([header, payload]));
+  }
+
+  private sendPong(payload: any): void {
+    const header = this.makeHeader(payload.length, 0xA);
     this.socket.write(Buffer.concat([header, payload]));
   }
 
@@ -33,21 +41,21 @@ export class WebSocketConnection {
     this.socket.end();
   }
 
-  private makeHeader(length: number): any {
+  private makeHeader(length: number, opcode: number): any {
     if (length < 126) {
-      return Buffer.from([0x81, length]);
+      return Buffer.from([0x80 | opcode, length]);
     }
 
     if (length <= 0xffff) {
       const header = Buffer.alloc(4);
-      header[0] = 0x81;
+      header[0] = 0x80 | opcode;
       header[1] = 126;
       header.writeUInt16BE(length, 2);
       return header;
     }
 
     const header = Buffer.alloc(10);
-    header[0] = 0x81;
+    header[0] = 0x80 | opcode;
     header[1] = 127;
     header.writeBigUInt64BE(BigInt(length), 2);
     return header;
@@ -65,19 +73,62 @@ export class WebSocketConnection {
         return;
       }
 
-      if (frame.opcode === 0x1) {
-        const text = frame.payload.toString("utf8");
-        this.messageHandlers.forEach((fn) => fn(text));
+      if (frame.opcode === 0x9) {
+        this.sendPong(frame.payload);
+        continue;
       }
+
+      if (frame.opcode === 0xA) {
+        continue;
+      }
+
+      if (frame.opcode === 0x1) {
+        if (this.fragmentedOpcode !== null) {
+          this.socket.destroy();
+          return;
+        }
+
+        if (frame.fin) {
+          const text = frame.payload.toString("utf8");
+          this.messageHandlers.forEach((fn) => fn(text));
+          continue;
+        }
+
+        this.fragmentedOpcode = frame.opcode;
+        this.fragmentedPayloads = [frame.payload];
+        continue;
+      }
+
+      if (frame.opcode === 0x0) {
+        if (this.fragmentedOpcode === null) {
+          this.socket.destroy();
+          return;
+        }
+
+        this.fragmentedPayloads.push(frame.payload);
+
+        if (frame.fin) {
+          const payload = Buffer.concat(this.fragmentedPayloads);
+          this.fragmentedOpcode = null;
+          this.fragmentedPayloads = [];
+          const text = payload.toString("utf8");
+          this.messageHandlers.forEach((fn) => fn(text));
+        }
+        continue;
+      }
+
+      this.socket.destroy();
+      return;
     }
   }
 
-  private readFrame(): { opcode: number; payload: any } | null {
+  private readFrame(): { fin: boolean; opcode: number; payload: any } | null {
     if (this.buffer.length < 2) return null;
 
     const first = this.buffer[0];
     const second = this.buffer[1];
 
+    const fin = (first & 0x80) !== 0;
     const opcode = first & 0x0f;
     const masked = (second & 0x80) !== 0;
     let length = second & 0x7f;
@@ -116,7 +167,13 @@ export class WebSocketConnection {
       }
     }
 
-    return { opcode, payload };
+    return { fin, opcode, payload };
+  }
+
+  private notifyClose(): void {
+    if (this.isClosed) return;
+    this.isClosed = true;
+    this.closeHandlers.forEach((fn) => fn());
   }
 }
 

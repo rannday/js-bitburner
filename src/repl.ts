@@ -43,11 +43,7 @@ export class BitburnerRepl {
         try {
           line = await rl.question("bb> ");
         } catch {
-          if (exiting) {
-            return;
-          }
-
-          throw new Error("Readline closed");
+          return;
         }
 
         const tokens = parseCommandLine(line);
