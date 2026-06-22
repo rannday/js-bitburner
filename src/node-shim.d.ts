@@ -8,6 +8,10 @@ declare module "node:crypto" {
   export function createHash(algorithm: string): any;
 }
 
+declare module "node:fs/promises" {
+  export function readFile(path: string, encoding: string): Promise<string>;
+}
+
 declare const process: {
   exitCode?: number;
   argv: string[];

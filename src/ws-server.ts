@@ -160,4 +160,17 @@ export class WebSocketServer {
       this.server.listen(this.port, this.host, resolve);
     });
   }
+
+  close(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.server.close((error: Error | undefined) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve();
+      });
+    });
+  }
 }
