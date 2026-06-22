@@ -19,8 +19,29 @@ const helpText = [
   "  all-metadata [server]",
   "  ram <server> <filename>",
   "  defs [local-path]",
-  "  save"
+  "  save <local-path>"
 ].join("\n");
+
+export class UsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UsageError";
+  }
+}
+
+type CommandIO = {
+  stdout: (value: string) => void;
+  stderr: (value: string) => void;
+};
+
+const defaultCommandIO: CommandIO = {
+  stdout: (value) => {
+    process.stdout.write(value);
+  },
+  stderr: (value) => {
+    process.stderr.write(value);
+  }
+};
 
 export class BitburnerRepl {
   constructor(private getApi: () => BitburnerRemoteApi | null) {}
@@ -31,10 +52,7 @@ export class BitburnerRepl {
       output: process.stdout
     });
 
-    let exiting = false;
-
     rl.on("SIGINT", () => {
-      exiting = true;
       rl.close();
     });
 
@@ -48,182 +66,193 @@ export class BitburnerRepl {
           return;
         }
 
-        const tokens = parseCommandLine(line);
-        if (tokens.length === 0) {
-          continue;
-        }
-
-        const [command, ...args] = tokens;
-
-        if (command === "help") {
-          process.stdout.write(`${helpText}\n`);
-          continue;
-        }
-
-        if (command === "quit" || command === "exit") {
-          exiting = true;
-          rl.close();
-          return;
-        }
-
-        const api = this.getApi();
-        if (!api) {
-          process.stdout.write("Bitburner is not connected.\n");
-          continue;
-        }
-
         try {
-          await this.runCommand(api, command, args);
+          const tokens = parseCommandLine(line);
+          if (tokens.length === 0) {
+            continue;
+          }
+
+          const [command, ...args] = tokens;
+
+          if (command === "help") {
+            defaultCommandIO.stdout(`${helpText}\n`);
+            continue;
+          }
+
+          if (command === "quit" || command === "exit") {
+            rl.close();
+            return;
+          }
+
+          const api = this.getApi();
+          if (!api) {
+            defaultCommandIO.stdout("Bitburner is not connected.\n");
+            continue;
+          }
+
+          await executeCommand(api, command, args, defaultCommandIO);
         } catch (error) {
-          process.stderr.write(`${String(error)}\n`);
+          if (error instanceof UsageError) {
+            defaultCommandIO.stderr(`${error.message}\n`);
+            continue;
+          }
+
+          defaultCommandIO.stderr(`${String(error)}\n`);
         }
       }
     } finally {
       rl.close();
     }
   }
+}
 
-  private async runCommand(api: BitburnerRemoteApi, command: string, args: string[]): Promise<void> {
-    switch (command) {
-      case "servers": {
-        const value = await api.getAllServers();
-        process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-        return;
-      }
-
-      case "files": {
-        const server = args[0] ?? "home";
-        const value = await api.getFileNames(server);
-        process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-        return;
-      }
-
-      case "get": {
-        const [server, filename, localPath] = args;
-        if (!server || !filename) {
-          throw new Error("get requires <server> <filename> [local-path]");
-        }
-        if (args.length > 3) {
-          throw new Error("get requires <server> <filename> [local-path]");
-        }
-
-        const value = await api.getFile(filename, server);
-        if (localPath) {
-          await writeTextFile(localPath, value);
-          process.stdout.write(`Wrote ${localPath}\n`);
-          return;
-        }
-
-        process.stdout.write(value);
-        return;
-      }
-
-      case "push": {
-        const [server, remoteFilename, localPath] = args;
-        if (!server || !remoteFilename || !localPath) {
-          throw new Error("push requires <server> <remote-filename> <local-path>");
-        }
-
-        const content = await readFile(localPath, "utf8");
-        const value = await api.pushFile(remoteFilename, content, server);
-        process.stdout.write(`${value}\n`);
-        return;
-      }
-
-      case "delete": {
-        const [server, filename] = args;
-        if (!server || !filename) {
-          throw new Error("delete requires <server> <filename>");
-        }
-
-        const value = await api.deleteFile(filename, server);
-        process.stdout.write(`${value}\n`);
-        return;
-      }
-
-      case "metadata": {
-        const [server, filename] = args;
-        if (!server || !filename) {
-          throw new Error("metadata requires <server> <filename>");
-        }
-
-        const value = await api.getFileMetadata(filename, server);
-        process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-        return;
-      }
-
-      case "all-files": {
-        if (args.length === 0) {
-          process.stdout.write("all-files can return a large payload. Use: all-files [server] <local-path>\n");
-          return;
-        }
-        if (args.length > 2) {
-          process.stdout.write("all-files can return a large payload. Use: all-files [server] <local-path>\n");
-          return;
-        }
-
-        const server = args.length === 1 ? "home" : args[0];
-        const localPath = args.length === 1 ? args[0] : args[1];
-
-        if (!localPath) {
-          process.stdout.write("all-files can return a large payload. Use: all-files [server] <local-path>\n");
-          return;
-        }
-
-        const value = await api.getAllFiles(server);
-        await writeTextFile(localPath, `${JSON.stringify(value, null, 2)}\n`);
-        process.stdout.write(`Wrote ${localPath}\n`);
-        return;
-      }
-
-      case "all-metadata": {
-        const server = args[0] ?? "home";
-        const value = await api.getAllFileMetadata(server);
-        process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-        return;
-      }
-
-      case "ram": {
-        const [server, filename] = args;
-        if (!server || !filename) {
-          throw new Error("ram requires <server> <filename>");
-        }
-
-        const value = await api.calculateRam(filename, server);
-        process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-        return;
-      }
-
-      case "defs": {
-        if (args.length > 1) {
-          throw new Error("defs requires [local-path]");
-        }
-
-        const value = await api.getDefinitionFile();
-        const localPath = args[0];
-        if (localPath) {
-          await writeTextFile(localPath, value);
-          process.stdout.write(`Wrote ${localPath}\n`);
-          return;
-        }
-
-        process.stdout.write(value);
-        return;
-      }
-
-      case "save": {
-        const value = await api.getSaveFile();
-        process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-        return;
-      }
-
-      default:
-        process.stdout.write('Unknown command. Type "help" for commands.\n');
+export async function executeCommand(
+  api: BitburnerRemoteApi,
+  command: string,
+  args: string[],
+  io: CommandIO = defaultCommandIO
+): Promise<void> {
+  switch (command) {
+    case "servers": {
+      const value = await api.getAllServers();
+      io.stdout(`${JSON.stringify(value, null, 2)}\n`);
+      return;
     }
+
+    case "files": {
+      const server = args[0] ?? "home";
+      const value = await api.getFileNames(server);
+      io.stdout(`${JSON.stringify(value, null, 2)}\n`);
+      return;
+    }
+
+    case "get": {
+      const [server, filename, localPath] = args;
+      if (!server || !filename || args.length > 3) {
+        throw new UsageError("get requires <server> <filename> [local-path]");
+      }
+
+      const value = await api.getFile(filename, server);
+      if (localPath) {
+        await writeTextFile(localPath, value);
+        io.stdout(`Wrote ${localPath}\n`);
+        return;
+      }
+
+      io.stdout(value);
+      return;
+    }
+
+    case "push": {
+      const [server, remoteFilename, localPath] = args;
+      if (!server || !remoteFilename || !localPath || args.length > 3) {
+        throw new UsageError("push requires <server> <remote-filename> <local-path>");
+      }
+
+      const content = await readFile(localPath, "utf8");
+      const value = await api.pushFile(remoteFilename, content, server);
+      io.stdout(`${value}\n`);
+      return;
+    }
+
+    case "delete": {
+      const [server, filename] = args;
+      if (!server || !filename || args.length > 2) {
+        throw new UsageError("delete requires <server> <filename>");
+      }
+
+      const value = await api.deleteFile(filename, server);
+      io.stdout(`${value}\n`);
+      return;
+    }
+
+    case "metadata": {
+      const [server, filename] = args;
+      if (!server || !filename || args.length > 2) {
+        throw new UsageError("metadata requires <server> <filename>");
+      }
+
+      const value = await api.getFileMetadata(filename, server);
+      io.stdout(`${JSON.stringify(value, null, 2)}\n`);
+      return;
+    }
+
+    case "all-files": {
+      if (args.length === 0 || args.length > 2) {
+        throw new UsageError("all-files requires <local-path> or [server] <local-path>");
+      }
+
+      const server = args.length === 1 ? "home" : args[0];
+      const localPath = args.length === 1 ? args[0] : args[1];
+
+      const value = await api.getAllFiles(server);
+      await writeTextFile(localPath, `${JSON.stringify(value, null, 2)}\n`);
+      io.stdout(`Wrote ${localPath}\n`);
+      return;
+    }
+
+    case "all-metadata": {
+      if (args.length > 1) {
+        throw new UsageError("all-metadata takes at most one optional server");
+      }
+
+      const server = args[0] ?? "home";
+      const value = await api.getAllFileMetadata(server);
+      io.stdout(`${JSON.stringify(value, null, 2)}\n`);
+      return;
+    }
+
+    case "ram": {
+      const [server, filename] = args;
+      if (!server || !filename || args.length > 2) {
+        throw new UsageError("ram requires <server> <filename>");
+      }
+
+      const value = await api.calculateRam(filename, server);
+      io.stdout(`${JSON.stringify(value, null, 2)}\n`);
+      return;
+    }
+
+    case "defs": {
+      if (args.length > 1) {
+        throw new UsageError("defs takes at most one optional local path");
+      }
+
+      const value = await api.getDefinitionFile();
+      const localPath = args[0];
+      if (localPath) {
+        await writeTextFile(localPath, value);
+        io.stdout(`Wrote ${localPath}\n`);
+        return;
+      }
+
+      io.stdout(value);
+      return;
+    }
+
+    case "save": {
+      if (args.length > 1) {
+        throw new UsageError("save requires <local-path>");
+      }
+
+      const localPath = args[0];
+      if (!localPath) {
+        io.stdout("save writes large data. Use: save <local-path>\n");
+        return;
+      }
+
+      const value = await api.getSaveFile();
+      await writeJsonFile(localPath, value);
+      io.stdout(`Wrote ${localPath}\n`);
+      return;
+    }
+
+    default:
+      io.stdout('Unknown command. Type "help" for commands.\n');
   }
 }
 
-function parseCommandLine(line: string): string[] {
+export function parseCommandLine(line: string): string[] {
   const tokens: string[] = [];
   let current = "";
   let quote: string | null = null;
@@ -270,6 +299,10 @@ function parseCommandLine(line: string): string[] {
     current += "\\";
   }
 
+  if (quote !== null) {
+    throw new UsageError("Unterminated quoted string.");
+  }
+
   if (current.length > 0) {
     tokens.push(current);
   }
@@ -285,4 +318,8 @@ async function writeTextFile(path: string, content: string): Promise<void> {
   }
 
   await writeFile(path, content, "utf8");
+}
+
+async function writeJsonFile(path: string, value: unknown): Promise<void> {
+  await writeTextFile(path, `${JSON.stringify(value, null, 2)}\n`);
 }

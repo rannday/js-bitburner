@@ -14,9 +14,17 @@
   "author": "Rann Day",
   "type": "module",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc --noEmitOnError",
     "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js"
+    "dev": "npm run build && node dist/index.js",
+    "test": "npm run build && node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^6.0.3"
   }
 }

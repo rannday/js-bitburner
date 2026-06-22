@@ -10,7 +10,7 @@ type JsonRpcResponse<T> = {
 type PendingCall<T> = {
   resolve: (value: T) => void;
   reject: (error: Error) => void;
-  timeout: any;
+  timeout: ReturnType<typeof setTimeout>;
 };
 
 export type FileMetadata = {
@@ -125,26 +125,32 @@ export class BitburnerRemoteApi {
   }
 
   private handleMessage(message: string): void {
-    let response: JsonRpcResponse<unknown>;
+    let parsed: unknown;
 
     try {
-      response = JSON.parse(message);
+      parsed = JSON.parse(message);
     } catch {
       return;
     }
 
-    const pending = this.pending.get(response.id);
-    if (!pending) return;
-
-    this.pending.delete(response.id);
-    clearTimeout(pending.timeout);
-
-    if (response.error !== undefined && response.error !== null) {
-      pending.reject(new Error(JSON.stringify(response.error)));
+    if (!isJsonRpcResponse(parsed)) {
       return;
     }
 
-    pending.resolve(response.result);
+    const pending = this.pending.get(parsed.id);
+    if (!pending) {
+      return;
+    }
+
+    this.pending.delete(parsed.id);
+    clearTimeout(pending.timeout);
+
+    if (parsed.error !== undefined && parsed.error !== null) {
+      pending.reject(new Error(formatRpcError(parsed.error)));
+      return;
+    }
+
+    pending.resolve(parsed.result);
   }
 
   private rejectAll(reason: string): void {
@@ -155,4 +161,32 @@ export class BitburnerRemoteApi {
 
     this.pending.clear();
   }
+}
+
+function isJsonRpcResponse(value: unknown): value is JsonRpcResponse<unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const response = value as { jsonrpc?: unknown; id?: unknown };
+  return response.jsonrpc === "2.0" && typeof response.id === "number" && Number.isFinite(response.id);
+}
+
+function formatRpcError(error: unknown): string {
+  if (typeof error === "string") {
+    return error;
+  }
+
+  if (error && typeof error === "object") {
+    try {
+      const text = JSON.stringify(error);
+      if (text !== undefined) {
+        return text;
+      }
+    } catch {
+      return String(error);
+    }
+  }
+
+  return String(error);
 }

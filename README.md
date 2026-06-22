@@ -5,3 +5,4 @@ Websocket server tool for connecting to Bitburner's Remote API
 * [Game source code](https://github.com/bitburner-official/bitburner-src)
 * [Remote API Docs](https://github.com/bitburner-official/bitburner-src/blob/dev/src/Documentation/doc/en/programming/remote_api.md)
 
+Commands include `save <local-path>` for writing the save payload to a file.
