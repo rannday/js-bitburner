@@ -1,163 +1,76 @@
-import { readFile } from "node:fs/promises";
 import { BitburnerRemoteApi } from "./bitburner.js";
+import { BitburnerRepl } from "./repl.js";
 import { WebSocketConnection, WebSocketServer } from "./ws-server.js";
 
 const host = "127.0.0.1";
 const port = 12525;
-const usage = [
-  "Usage:",
-  "  node dist/index.js servers",
-  "  node dist/index.js files [server]",
-  "  node dist/index.js get <server> <filename>",
-  "  node dist/index.js push <server> <remote-filename> <local-path>",
-  "  node dist/index.js delete <server> <filename>",
-  "  node dist/index.js metadata <server> <filename>",
-  "  node dist/index.js all-files [server]",
-  "  node dist/index.js all-metadata [server]",
-  "  node dist/index.js ram <server> <filename>",
-  "  node dist/index.js defs",
-  "  node dist/index.js save"
-].join("\n");
 
-const args = process.argv.slice(2);
-const command = args[0];
+let api: BitburnerRemoteApi | null = null;
+let currentConnection: WebSocketConnection | null = null;
+let currentConnectionId = 0;
+let readyResolve: (() => void) | null = null;
+let shuttingDown = false;
 
-if (!command) {
-  process.stderr.write(`${usage}\n`);
-  process.exitCode = 1;
-} else {
-  const server = new WebSocketServer(port, host);
-  const connectionPromise = new Promise<WebSocketConnection>((resolve) => {
-    server.onConnection(resolve);
+const ready = new Promise<void>((resolve) => {
+  readyResolve = resolve;
+});
+
+const server = new WebSocketServer(port, host);
+
+server.onConnection((connection) => {
+  currentConnectionId += 1;
+  const connectionId = currentConnectionId;
+
+  currentConnection = connection;
+  api = new BitburnerRemoteApi(connection);
+  process.stdout.write('Bitburner connected.\nType "help" for commands.\n');
+
+  if (readyResolve) {
+    readyResolve();
+    readyResolve = null;
+  }
+
+  connection.onClose(() => {
+    if (connectionId !== currentConnectionId) {
+      return;
+    }
+
+    currentConnection = null;
+    api = null;
+
+    if (!shuttingDown) {
+      process.stdout.write("Bitburner disconnected.\nWaiting for Bitburner to reconnect...\n");
+    }
   });
+});
+
+try {
+  await server.listen();
+  process.stdout.write(`Listening on ws://${host}:${port}\n`);
+  process.stdout.write("Waiting for Bitburner to connect...\n");
+
+  await ready;
+
+  const repl = new BitburnerRepl(() => api);
+  await repl.run();
+} catch (error) {
+  process.stderr.write(`${String(error)}\n`);
+  process.exitCode = 1;
+} finally {
+  shuttingDown = true;
+
+  const connection = currentConnection as WebSocketConnection | null;
+  if (connection) {
+    (connection as any).close();
+    currentConnection = null;
+  }
 
   try {
-    await server.listen();
-    process.stdout.write(`Listening on ws://${host}:${port}\n`);
-
-    const connection = await connectionPromise;
-    const api = new BitburnerRemoteApi(connection);
-
-    try {
-      await runCommand(api, args);
-    } finally {
-      connection.close();
-    }
+    await server.close();
   } catch (error) {
-    process.stderr.write(`${String(error)}\n`);
-    process.exitCode = 1;
-  } finally {
-    try {
-      await server.close();
-    } catch (error) {
-      if (process.exitCode === undefined) {
-        process.stderr.write(`${String(error)}\n`);
-        process.exitCode = 1;
-      }
+    if (process.exitCode === undefined) {
+      process.stderr.write(`${String(error)}\n`);
+      process.exitCode = 1;
     }
-  }
-}
-
-async function runCommand(api: BitburnerRemoteApi, args: string[]): Promise<void> {
-  const [command, ...rest] = args;
-
-  switch (command) {
-    case "servers": {
-      const value = await api.getAllServers();
-      process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-      return;
-    }
-
-    case "files": {
-      const server = rest[0] ?? "home";
-      const value = await api.getFileNames(server);
-      process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-      return;
-    }
-
-    case "get": {
-      const [server, filename] = rest;
-      if (!server || !filename) {
-        throw new Error("get requires <server> <filename>");
-      }
-
-      const value = await api.getFile(filename, server);
-      process.stdout.write(value);
-      return;
-    }
-
-    case "push": {
-      const [server, remoteFilename, localPath] = rest;
-      if (!server || !remoteFilename || !localPath) {
-        throw new Error("push requires <server> <remote-filename> <local-path>");
-      }
-
-      const content = await readFile(localPath, "utf8");
-      const value = await api.pushFile(remoteFilename, content, server);
-      process.stdout.write(`${value}\n`);
-      return;
-    }
-
-    case "delete": {
-      const [server, filename] = rest;
-      if (!server || !filename) {
-        throw new Error("delete requires <server> <filename>");
-      }
-
-      const value = await api.deleteFile(filename, server);
-      process.stdout.write(`${value}\n`);
-      return;
-    }
-
-    case "metadata": {
-      const [server, filename] = rest;
-      if (!server || !filename) {
-        throw new Error("metadata requires <server> <filename>");
-      }
-
-      const value = await api.getFileMetadata(filename, server);
-      process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-      return;
-    }
-
-    case "all-files": {
-      const server = rest[0] ?? "home";
-      const value = await api.getAllFiles(server);
-      process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-      return;
-    }
-
-    case "all-metadata": {
-      const server = rest[0] ?? "home";
-      const value = await api.getAllFileMetadata(server);
-      process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-      return;
-    }
-
-    case "ram": {
-      const [server, filename] = rest;
-      if (!server || !filename) {
-        throw new Error("ram requires <server> <filename>");
-      }
-
-      const value = await api.calculateRam(filename, server);
-      process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-      return;
-    }
-
-    case "defs": {
-      const value = await api.getDefinitionFile();
-      process.stdout.write(value);
-      return;
-    }
-
-    case "save": {
-      const value = await api.getSaveFile();
-      process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-      return;
-    }
-
-    default:
-      throw new Error(`Unknown command: ${command}`);
   }
 }

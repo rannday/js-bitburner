@@ -12,9 +12,17 @@ declare module "node:fs/promises" {
   export function readFile(path: string, encoding: string): Promise<string>;
 }
 
+declare module "node:readline/promises" {
+  export function createInterface(options: {
+    input: any;
+    output: any;
+  }): any;
+}
+
 declare const process: {
   exitCode?: number;
   argv: string[];
+  stdin: any;
   stdout: {
     write(data: string): void;
   };
