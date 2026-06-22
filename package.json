@@ -1,0 +1,22 @@
+{
+  "name": "js-bitburner",
+  "version": "0.0.1",
+  "description": "Bitburner Remote API tool",
+  "homepage": "https://github.com/rannday/js-bitburner#readme",
+  "bugs": {
+    "url": "https://github.com/rannday/js-bitburner/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rannday/js-bitburner.git"
+  },
+  "license": "ISC",
+  "author": "Rann Day",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
+  }
+}
