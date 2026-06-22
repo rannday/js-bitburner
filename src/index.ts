@@ -20,6 +20,11 @@ const server = new WebSocketServer(port, host);
 server.onConnection((connection) => {
   currentConnectionId += 1;
   const connectionId = currentConnectionId;
+  const previousConnection = currentConnection;
+
+  if (previousConnection) {
+    previousConnection.close();
+  }
 
   currentConnection = connection;
   api = new BitburnerRemoteApi(connection);
@@ -61,7 +66,7 @@ try {
 
   const connection = currentConnection as WebSocketConnection | null;
   if (connection) {
-    (connection as any).close();
+    connection.close();
     currentConnection = null;
   }
 

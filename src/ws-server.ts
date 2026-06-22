@@ -4,11 +4,16 @@ import { createHash } from "node:crypto";
 type MessageHandler = (message: string) => void;
 type CloseHandler = () => void;
 
+const MAX_FRAME_PAYLOAD_LENGTH = 16 * 1024 * 1024;
+const MAX_MESSAGE_PAYLOAD_LENGTH = 64 * 1024 * 1024;
+
 export class WebSocketConnection {
   private buffer = Buffer.alloc(0);
   private fragmentedOpcode: number | null = null;
   private fragmentedPayloads: any[] = [];
+  private fragmentedPayloadLength = 0;
   private isClosed = false;
+  private closeNotified = false;
   private messageHandlers: MessageHandler[] = [];
   private closeHandlers: CloseHandler[] = [];
 
@@ -27,17 +32,25 @@ export class WebSocketConnection {
   }
 
   sendText(text: string): void {
-    const payload = Buffer.from(text, "utf8");
-    const header = this.makeHeader(payload.length, 0x1);
-    this.socket.write(Buffer.concat([header, payload]));
+    this.sendFrame(0x1, Buffer.from(text, "utf8"));
   }
 
   private sendPong(payload: any): void {
-    const header = this.makeHeader(payload.length, 0xA);
-    this.socket.write(Buffer.concat([header, payload]));
+    this.sendFrame(0xA, payload);
   }
 
   close(): void {
+    if (this.isClosed) return;
+    this.isClosed = true;
+
+    try {
+      this.socket.write(Buffer.concat([this.makeHeader(0, 0x8), Buffer.alloc(0)]));
+    } catch {
+      this.safeDestroy();
+      this.notifyClose();
+      return;
+    }
+
     this.socket.end();
   }
 
@@ -62,63 +75,24 @@ export class WebSocketConnection {
   }
 
   private handleData(chunk: any): void {
+    if (this.isClosed) {
+      return;
+    }
+
     this.buffer = Buffer.concat([this.buffer, chunk]);
 
-    while (true) {
-      const frame = this.readFrame();
-      if (!frame) return;
+    try {
+      while (true) {
+        const frame = this.readFrame();
+        if (!frame) return;
 
-      if (frame.opcode === 0x8) {
-        this.close();
-        return;
-      }
-
-      if (frame.opcode === 0x9) {
-        this.sendPong(frame.payload);
-        continue;
-      }
-
-      if (frame.opcode === 0xA) {
-        continue;
-      }
-
-      if (frame.opcode === 0x1) {
-        if (this.fragmentedOpcode !== null) {
-          this.socket.destroy();
+        this.handleFrame(frame);
+        if (this.isClosed) {
           return;
         }
-
-        if (frame.fin) {
-          const text = frame.payload.toString("utf8");
-          this.messageHandlers.forEach((fn) => fn(text));
-          continue;
-        }
-
-        this.fragmentedOpcode = frame.opcode;
-        this.fragmentedPayloads = [frame.payload];
-        continue;
       }
-
-      if (frame.opcode === 0x0) {
-        if (this.fragmentedOpcode === null) {
-          this.socket.destroy();
-          return;
-        }
-
-        this.fragmentedPayloads.push(frame.payload);
-
-        if (frame.fin) {
-          const payload = Buffer.concat(this.fragmentedPayloads);
-          this.fragmentedOpcode = null;
-          this.fragmentedPayloads = [];
-          const text = payload.toString("utf8");
-          this.messageHandlers.forEach((fn) => fn(text));
-        }
-        continue;
-      }
-
-      this.socket.destroy();
-      return;
+    } catch {
+      this.failConnection();
     }
   }
 
@@ -148,12 +122,22 @@ export class WebSocketConnection {
       offset += 8;
     }
 
+    if (length > MAX_FRAME_PAYLOAD_LENGTH) {
+      throw new Error("WebSocket frame too large");
+    }
+
+    if ((second & 0x80) === 0) {
+      throw new Error("Client frames must be masked");
+    }
+
     let mask: any = null;
 
-    if (masked) {
-      if (this.buffer.length < offset + 4) return null;
-      mask = this.buffer.subarray(offset, offset + 4);
-      offset += 4;
+    if (this.buffer.length < offset + 4) return null;
+    mask = this.buffer.subarray(offset, offset + 4);
+    offset += 4;
+
+    if (length > MAX_FRAME_PAYLOAD_LENGTH) {
+      throw new Error("WebSocket frame too large");
     }
 
     if (this.buffer.length < offset + length) return null;
@@ -161,17 +145,125 @@ export class WebSocketConnection {
     const payload = Buffer.from(this.buffer.subarray(offset, offset + length));
     this.buffer = this.buffer.subarray(offset + length);
 
-    if (masked) {
-      for (let i = 0; i < payload.length; i++) {
-        payload[i] ^= mask[i % 4];
-      }
+    for (let i = 0; i < payload.length; i++) {
+      payload[i] ^= mask[i % 4];
     }
 
     return { fin, opcode, payload };
   }
 
+  private handleFrame(frame: { fin: boolean; opcode: number; payload: any }): void {
+    switch (frame.opcode) {
+      case 0x0:
+        this.handleContinuation(frame);
+        return;
+      case 0x1:
+        this.handleTextFrame(frame);
+        return;
+      case 0x8:
+        if (!frame.fin || frame.payload.length > 125) {
+          throw new Error("Invalid close frame");
+        }
+        this.close();
+        return;
+      case 0x9:
+        if (!frame.fin || frame.payload.length > 125) {
+          throw new Error("Invalid ping frame");
+        }
+        this.sendPong(frame.payload);
+        return;
+      case 0xA:
+        if (!frame.fin || frame.payload.length > 125) {
+          throw new Error("Invalid pong frame");
+        }
+        return;
+      default:
+        throw new Error("Unsupported WebSocket opcode");
+    }
+  }
+
+  private handleTextFrame(frame: { fin: boolean; opcode: number; payload: any }): void {
+    if (this.fragmentedOpcode !== null) {
+      throw new Error("Unexpected text frame during fragmented message");
+    }
+
+    if (frame.fin) {
+      this.emitMessage(frame.payload.toString("utf8"));
+      return;
+    }
+
+    this.fragmentedOpcode = frame.opcode;
+    this.fragmentedPayloads = [frame.payload];
+    this.fragmentedPayloadLength = frame.payload.length;
+  }
+
+  private handleContinuation(frame: { fin: boolean; opcode: number; payload: any }): void {
+    if (this.fragmentedOpcode === null) {
+      throw new Error("Unexpected continuation frame");
+    }
+
+    if (this.fragmentedPayloadLength + frame.payload.length > MAX_MESSAGE_PAYLOAD_LENGTH) {
+      throw new Error("WebSocket message too large");
+    }
+
+    this.fragmentedPayloads.push(frame.payload);
+    this.fragmentedPayloadLength += frame.payload.length;
+
+    if (!frame.fin) {
+      return;
+    }
+
+    const payload = Buffer.concat(this.fragmentedPayloads);
+    const opcode = this.fragmentedOpcode;
+    this.fragmentedOpcode = null;
+    this.fragmentedPayloads = [];
+    this.fragmentedPayloadLength = 0;
+
+    if (opcode !== 0x1) {
+      throw new Error("Unsupported fragmented message opcode");
+    }
+
+    this.emitMessage(payload.toString("utf8"));
+  }
+
+  private emitMessage(message: string): void {
+    for (const handler of this.messageHandlers) {
+      handler(message);
+    }
+  }
+
+  private sendFrame(opcode: number, payload: any): void {
+    if (this.isClosed) {
+      return;
+    }
+
+    try {
+      this.socket.write(Buffer.concat([this.makeHeader(payload.length, opcode), payload]));
+    } catch {
+      this.failConnection();
+    }
+  }
+
+  private failConnection(): void {
+    if (this.isClosed) {
+      return;
+    }
+
+    this.safeDestroy();
+    this.notifyClose();
+  }
+
+  private safeDestroy(): void {
+    try {
+      this.socket.destroy();
+    } catch {
+      // Ignore socket teardown errors.
+    }
+  }
+
   private notifyClose(): void {
-    if (this.isClosed) return;
+    if (this.closeNotified) return;
+    this.closeNotified = true;
     this.isClosed = true;
     this.closeHandlers.forEach((fn) => fn());
   }

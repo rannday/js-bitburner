@@ -10,6 +10,12 @@ declare module "node:crypto" {
 
 declare module "node:fs/promises" {
   export function readFile(path: string, encoding: string): Promise<string>;
+  export function writeFile(path: string, data: string, encoding: string): Promise<void>;
+  export function mkdir(path: string, options: any): Promise<void>;
+}
+
+declare module "node:path" {
+  export function dirname(path: string): string;
 }
 
 declare module "node:readline/promises" {
@@ -30,3 +36,6 @@ declare const process: {
     write(data: string): void;
   };
 };
+
+declare function setTimeout(handler: (...args: any[]) => void, timeout?: number, ...args: any[]): any;
+declare function clearTimeout(timeoutId: any): void;

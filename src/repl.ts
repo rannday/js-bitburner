@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { BitburnerRemoteApi } from "./bitburner.js";
 
@@ -9,14 +10,15 @@ const helpText = [
   "  exit",
   "  servers",
   "  files [server]",
-  "  get <server> <filename>",
+  "  get <server> <filename> [local-path]",
   "  push <server> <remote-filename> <local-path>",
   "  delete <server> <filename>",
   "  metadata <server> <filename>",
-  "  all-files [server]",
+  "  all-files <local-path>",
+  "  all-files <server> <local-path>",
   "  all-metadata [server]",
   "  ram <server> <filename>",
-  "  defs",
+  "  defs [local-path]",
   "  save"
 ].join("\n");
 
@@ -97,12 +99,21 @@ export class BitburnerRepl {
       }
 
       case "get": {
-        const [server, filename] = args;
+        const [server, filename, localPath] = args;
         if (!server || !filename) {
-          throw new Error("get requires <server> <filename>");
+          throw new Error("get requires <server> <filename> [local-path]");
+        }
+        if (args.length > 3) {
+          throw new Error("get requires <server> <filename> [local-path]");
         }
 
         const value = await api.getFile(filename, server);
+        if (localPath) {
+          await writeTextFile(localPath, value);
+          process.stdout.write(`Wrote ${localPath}\n`);
+          return;
+        }
+
         process.stdout.write(value);
         return;
       }
@@ -142,9 +153,26 @@ export class BitburnerRepl {
       }
 
       case "all-files": {
-        const server = args[0] ?? "home";
+        if (args.length === 0) {
+          process.stdout.write("all-files can return a large payload. Use: all-files [server] <local-path>\n");
+          return;
+        }
+        if (args.length > 2) {
+          process.stdout.write("all-files can return a large payload. Use: all-files [server] <local-path>\n");
+          return;
+        }
+
+        const server = args.length === 1 ? "home" : args[0];
+        const localPath = args.length === 1 ? args[0] : args[1];
+
+        if (!localPath) {
+          process.stdout.write("all-files can return a large payload. Use: all-files [server] <local-path>\n");
+          return;
+        }
+
         const value = await api.getAllFiles(server);
-        process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+        await writeTextFile(localPath, `${JSON.stringify(value, null, 2)}\n`);
+        process.stdout.write(`Wrote ${localPath}\n`);
         return;
       }
 
@@ -167,7 +195,18 @@ export class BitburnerRepl {
       }
 
       case "defs": {
+        if (args.length > 1) {
+          throw new Error("defs requires [local-path]");
+        }
+
         const value = await api.getDefinitionFile();
+        const localPath = args[0];
+        if (localPath) {
+          await writeTextFile(localPath, value);
+          process.stdout.write(`Wrote ${localPath}\n`);
+          return;
+        }
+
         process.stdout.write(value);
         return;
       }
@@ -236,4 +275,14 @@ function parseCommandLine(line: string): string[] {
   }
 
   return tokens;
+}
+
+async function writeTextFile(path: string, content: string): Promise<void> {
+  const parent = dirname(path);
+
+  if (parent !== "" && parent !== ".") {
+    await mkdir(parent, { recursive: true });
+  }
+
+  await writeFile(path, content, "utf8");
 }

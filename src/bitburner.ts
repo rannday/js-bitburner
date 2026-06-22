@@ -10,6 +10,7 @@ type JsonRpcResponse<T> = {
 type PendingCall<T> = {
   resolve: (value: T) => void;
   reject: (error: Error) => void;
+  timeout: any;
 };
 
 export type FileMetadata = {
@@ -37,6 +38,8 @@ export type ServerInfo = {
 };
 
 export class BitburnerRemoteApi {
+  private static readonly defaultTimeoutMs = 30_000;
+
   private nextId = 1;
   private pending = new Map<number, PendingCall<unknown>>();
 
@@ -100,9 +103,21 @@ export class BitburnerRemoteApi {
     };
 
     return new Promise<T>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (!pending) {
+          return;
+        }
+
+        this.pending.delete(id);
+        clearTimeout(pending.timeout);
+        pending.reject(new Error(`Timed out waiting for ${method}`));
+      }, BitburnerRemoteApi.defaultTimeoutMs);
+
       this.pending.set(id, {
         resolve: resolve as (value: unknown) => void,
-        reject
+        reject,
+        timeout
       });
 
       this.connection.sendText(JSON.stringify(request));
@@ -122,6 +137,7 @@ export class BitburnerRemoteApi {
     if (!pending) return;
 
     this.pending.delete(response.id);
+    clearTimeout(pending.timeout);
 
     if (response.error !== undefined && response.error !== null) {
       pending.reject(new Error(JSON.stringify(response.error)));
@@ -133,6 +149,7 @@ export class BitburnerRemoteApi {
 
   private rejectAll(reason: string): void {
     for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
       pending.reject(new Error(reason));
     }
 
