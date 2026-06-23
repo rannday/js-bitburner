@@ -9,7 +9,12 @@ const DEFAULT_SPACING_MS = 25;
 const LAUNCH_LEAD_MS = 8;
 const PREP_MONEY_RATIO = 0.99;
 const PREP_SECURITY_TOLERANCE = 0.05;
+const MAX_PREP_GROW_THREADS = 500;
+const MAX_PREP_WEAKEN_THREADS = 500;
 const LOOP_SLEEP_MS = 5;
+const PREP_WAIT_MS = 1000;
+const BATCH_STATUS_EARLY_COUNT = 3;
+const BATCH_STATUS_INTERVAL = 25;
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -82,99 +87,91 @@ async function runJit(ns, target, workers, plan, spacing, hackFraction) {
 
   let batchId = 0;
   let nextHackFinish = Date.now() + plan.weakenTime + spacing * 8;
+  /** @type {{ batchId: number, name: string, script: string, threads: number, duration: number, finishAt: number, offset: number, launchAt: number }[]} */
+  const eventQueue = [];
   /** @type {number[]} */
   const activeBatchFinishes = [];
 
-  while (true) {
-    pruneFinished(activeBatchFinishes);
-    while (activeBatchFinishes.length >= maxActiveBatches) {
-      const wait = activeBatchFinishes[0] - Date.now();
-      if (wait > 0) {
-        await ns.sleep(wait);
-      } else {
-        await ns.sleep(LOOP_SLEEP_MS);
+  const fillEventQueue = () => {
+    while (activeBatchFinishes.length < maxActiveBatches) {
+      const money = ns.getServerMoneyAvailable(target);
+      const maxMoney = ns.getServerMaxMoney(target);
+      const security = ns.getServerSecurityLevel(target);
+      const minSecurity = ns.getServerMinSecurityLevel(target);
+
+      const badlyDrifted = money < maxMoney * 0.80 || security > minSecurity + 5;
+      if (badlyDrifted) {
+        ns.print("Target drifted too far. Re-prepping.");
+        return false;
       }
 
-      pruneFinished(activeBatchFinishes);
+      const currentBatch = batchId++;
+      if (shouldLogBatchStatus(currentBatch)) {
+        ns.print(`plan batch=${currentBatch} hack=0ms weaken-hack=${spacing}ms grow=${spacing * 2}ms weaken-grow=${spacing * 3}ms`);
+        ns.print(
+          `batch=${currentBatch} money=${formatMoneyPercent(ns, target)} sec=${security.toFixed(2)}/${minSecurity.toFixed(2)} hackFraction=${formatPercent(hackFraction)}`
+        );
+      }
+
+      const batchEvents = createBatchEvents(currentBatch, nextHackFinish, spacing, plan);
+      if (!batchEvents) {
+        ns.print(`invalid batch timing batch=${currentBatch}`);
+        return false;
+      }
+
+      eventQueue.push(...batchEvents);
+      activeBatchFinishes.push(batchEvents[3].finishAt);
+      nextHackFinish += batchInterval;
     }
 
-    const money = ns.getServerMoneyAvailable(target);
-    const maxMoney = ns.getServerMaxMoney(target);
-    const security = ns.getServerSecurityLevel(target);
-    const minSecurity = ns.getServerMinSecurityLevel(target);
+    return true;
+  };
 
-    const badlyDrifted = money < maxMoney * 0.80 || security > minSecurity + 5;
+  while (true) {
+    pruneFinishedBatchFinishes(activeBatchFinishes, Date.now());
+    if (!fillEventQueue()) {
+      return hackFraction;
+    }
+    eventQueue.sort((a, b) => a.launchAt - b.launchAt || a.batchId - b.batchId || a.offset - b.offset);
 
-    if (badlyDrifted) {
-      ns.print("Target drifted too far. Re-prepping.");
+    const nextEvent = eventQueue[0];
+    if (!nextEvent) {
+      await ns.sleep(LOOP_SLEEP_MS);
+      continue;
+    }
+
+    const wait = nextEvent.launchAt - Date.now();
+    if (wait > 0) {
+      await ns.sleep(Math.min(wait, LOOP_SLEEP_MS));
+      continue;
+    }
+
+    eventQueue.shift();
+
+    if (Date.now() > nextEvent.finishAt - nextEvent.duration + 250) {
+      ns.print(`stale event batch=${nextEvent.batchId} event=${nextEvent.name}`);
       return hackFraction;
     }
 
-    const currentBatch = batchId++;
-    const batchDoneAt = nextHackFinish + spacing * 3;
-    const events = [
-      {
-        name: "weaken-hack",
-        script: WEAKEN_SCRIPT,
-        threads: plan.weakHackThreads,
-        duration: plan.weakenTime,
-        finishAt: nextHackFinish + spacing
-      },
-      {
-        name: "hack",
-        script: HACK_SCRIPT,
-        threads: plan.hackThreads,
-        duration: plan.hackTime,
-        finishAt: nextHackFinish
-      },
-      {
-        name: "grow",
-        script: GROW_SCRIPT,
-        threads: plan.growThreads,
-        duration: plan.growTime,
-        finishAt: nextHackFinish + spacing * 2
-      },
-      {
-        name: "weaken-grow",
-        script: WEAKEN_SCRIPT,
-        threads: plan.weakGrowThreads,
-        duration: plan.weakenTime,
-        finishAt: nextHackFinish + spacing * 3
-      }
-    ].sort((a, b) => launchAt(a) - launchAt(b));
-
-    let failed = false;
-
-    for (const event of events) {
-      const wait = launchAt(event) - Date.now();
-      if (wait > 0) {
-        await ns.sleep(wait);
-      }
-
-      const launched = launchDistributed(ns, workers, event.script, event.threads, [
-        target,
-        event.finishAt,
-        event.duration,
-        `${currentBatch}:${event.name}`
-      ], event.name, String(currentBatch));
-
-      if (!launched) {
-        failed = true;
-        break;
-      }
-    }
-
-    if (failed) {
-      return Math.max(0.01, hackFraction * 0.90);
-    }
-
-    activeBatchFinishes.push(batchDoneAt);
-    nextHackFinish += batchInterval;
-
-    if ((currentBatch + 1) % 25 === 0) {
+    if (nextEvent.batchId < BATCH_STATUS_EARLY_COUNT) {
       ns.print(
-        `batch=${currentBatch} money=${formatPercent(maxMoney <= 0 ? 0 : money / maxMoney)} sec=${formatFixed(security)}/${formatFixed(minSecurity)} hackFraction=${formatPercent(hackFraction)}`
+        `launch batch=${nextEvent.batchId} event=${nextEvent.name} threads=${nextEvent.threads} startsIn=${Math.max(0, Math.round(nextEvent.launchAt - Date.now()))} finishesIn=${Math.max(0, Math.round(nextEvent.finishAt - Date.now()))} offset=${nextEvent.offset}`
       );
+    }
+
+    const availableBefore = availableDistributedThreads(ns, workers, nextEvent.script);
+    const result = runDistributed(ns, workers, nextEvent.script, nextEvent.threads, [
+      target,
+      nextEvent.finishAt,
+      nextEvent.duration,
+      `${nextEvent.batchId}:${nextEvent.name}`
+    ]);
+
+    if (!result.ok) {
+      ns.print(
+        `missed ${nextEvent.name} batch=${nextEvent.batchId} need=${result.requested} available=${availableBefore} scriptRam=${ns.getScriptRam(nextEvent.script, "home")}`
+      );
+      return Math.max(0.01, hackFraction * 0.9);
     }
 
     await ns.sleep(LOOP_SLEEP_MS);
@@ -182,10 +179,61 @@ async function runJit(ns, target, workers, plan, spacing, hackFraction) {
 }
 
 /**
- * @param {{ finishAt: number, duration: number }} event
+ * @param {number} batchId
+ * @param {number} hackFinish
+ * @param {number} spacing
+ * @param {ReturnType<typeof makeBatchPlan>} plan
+ * @returns {Array<{ batchId: number, name: string, script: string, threads: number, duration: number, finishAt: number, offset: number, launchAt: number }>|null}
  */
-function launchAt(event) {
-  return event.finishAt - event.duration - LAUNCH_LEAD_MS;
+function createBatchEvents(batchId, hackFinish, spacing, plan) {
+  const events = [
+    {
+      batchId,
+      name: "hack",
+      script: HACK_SCRIPT,
+      threads: plan.hackThreads,
+      duration: plan.hackTime,
+      finishAt: hackFinish,
+      offset: 0
+    },
+    {
+      batchId,
+      name: "weaken-hack",
+      script: WEAKEN_SCRIPT,
+      threads: plan.weakHackThreads,
+      duration: plan.weakenTime,
+      finishAt: hackFinish + spacing,
+      offset: spacing
+    },
+    {
+      batchId,
+      name: "grow",
+      script: GROW_SCRIPT,
+      threads: plan.growThreads,
+      duration: plan.growTime,
+      finishAt: hackFinish + spacing * 2,
+      offset: spacing * 2
+    },
+    {
+      batchId,
+      name: "weaken-grow",
+      script: WEAKEN_SCRIPT,
+      threads: plan.weakGrowThreads,
+      duration: plan.weakenTime,
+      finishAt: hackFinish + spacing * 3,
+      offset: spacing * 3
+    }
+  ];
+
+  if (!(events[0].finishAt < events[1].finishAt && events[1].finishAt < events[2].finishAt && events[2].finishAt < events[3].finishAt)) {
+    return null;
+  }
+
+  for (const event of events) {
+    event.launchAt = event.finishAt - event.duration - LAUNCH_LEAD_MS;
+  }
+
+  return events;
 }
 
 /**
@@ -254,16 +302,28 @@ async function prepTarget(ns, target, workers) {
     }
 
     if (needsWeaken) {
-      const weakenThreads = Math.ceil((security - minSecurity) / ns.weakenAnalyze(1));
-      ns.print(`prep weaken sec=${formatFixed(security)}/${formatFixed(minSecurity)} threads=${weakenThreads}`);
+      const requiredWeakenThreads = Math.ceil((security - minSecurity) / ns.weakenAnalyze(1));
+      const availableWeakenThreads = availableDistributedThreads(ns, workers, WEAKEN_SCRIPT);
+      const weakenChunkThreads = Math.min(requiredWeakenThreads, availableWeakenThreads, MAX_PREP_WEAKEN_THREADS);
 
-      if (!launchDistributed(ns, workers, WEAKEN_SCRIPT, weakenThreads, [
+      if (weakenChunkThreads <= 0) {
+        ns.print(`prep weaken waiting for RAM required=${requiredWeakenThreads} available=${availableWeakenThreads}`);
+        await ns.sleep(PREP_WAIT_MS);
+        continue;
+      }
+
+      ns.print(`prep weaken sec=${security.toFixed(2)}/${minSecurity.toFixed(2)} threads=${weakenChunkThreads}`);
+
+      const weakenResult = runDistributed(ns, workers, WEAKEN_SCRIPT, weakenChunkThreads, [
         target,
         Date.now() + ns.getWeakenTime(target),
         ns.getWeakenTime(target),
         "prep-weaken"
-      ], "weaken", "prep")) {
-        await ns.sleep(5_000);
+      ]);
+
+      if (!weakenResult.ok) {
+        ns.print(`prep weaken waiting for RAM required=${weakenResult.requested} available=${availableWeakenThreads}`);
+        await ns.sleep(PREP_WAIT_MS);
         continue;
       }
 
@@ -274,33 +334,56 @@ async function prepTarget(ns, target, workers) {
     if (needsGrow) {
       const safeMoney = Math.max(1, money);
       const multiplier = maxMoney / safeMoney;
-      const growThreads = Math.ceil(ns.growthAnalyze(target, multiplier));
-      const growSecurity = ns.growthAnalyzeSecurity(growThreads, target);
-      const weakenThreads = Math.ceil(growSecurity / ns.weakenAnalyze(1));
+      const requiredGrowThreads = Math.ceil(ns.growthAnalyze(target, multiplier));
+      const availableGrowThreads = availableDistributedThreads(ns, workers, GROW_SCRIPT);
+      const growChunkThreads = Math.min(requiredGrowThreads, availableGrowThreads, MAX_PREP_GROW_THREADS);
 
-      ns.print(`prep grow money=${formatPercent(maxMoney <= 0 ? 0 : money / maxMoney)} threads=${growThreads}`);
+      if (growChunkThreads <= 0) {
+        ns.print(`prep grow waiting for RAM required=${requiredGrowThreads} available=${availableGrowThreads}`);
+        await ns.sleep(PREP_WAIT_MS);
+        continue;
+      }
 
-      if (!launchDistributed(ns, workers, GROW_SCRIPT, growThreads, [
+      ns.print(`prep grow money=${formatMoneyPercent(ns, target)} threads=${growChunkThreads}`);
+
+      const growResult = runDistributed(ns, workers, GROW_SCRIPT, growChunkThreads, [
         target,
         Date.now() + ns.getGrowTime(target),
         ns.getGrowTime(target),
         "prep-grow"
-      ], "grow", "prep")) {
-        await ns.sleep(5_000);
+      ]);
+
+      if (!growResult.ok) {
+        ns.print(`prep grow waiting for RAM required=${growResult.requested} available=${availableGrowThreads}`);
+        await ns.sleep(PREP_WAIT_MS);
         continue;
       }
 
       await ns.sleep(ns.getGrowTime(target) + 250);
 
-      ns.print(`prep post-grow weaken threads=${weakenThreads}`);
+      const growSecurity = ns.growthAnalyzeSecurity(growChunkThreads, target);
+      const requiredWeakenThreads = Math.ceil(growSecurity / ns.weakenAnalyze(1));
+      const availableWeakenThreads = availableDistributedThreads(ns, workers, WEAKEN_SCRIPT);
+      const weakenChunkThreads = Math.min(requiredWeakenThreads, availableWeakenThreads, MAX_PREP_WEAKEN_THREADS);
 
-      if (!launchDistributed(ns, workers, WEAKEN_SCRIPT, weakenThreads, [
+      if (weakenChunkThreads <= 0) {
+        ns.print(`prep post-grow weaken waiting for RAM required=${requiredWeakenThreads} available=${availableWeakenThreads}`);
+        await ns.sleep(PREP_WAIT_MS);
+        continue;
+      }
+
+      ns.print(`prep post-grow weaken threads=${weakenChunkThreads}`);
+
+      const weakenResult = runDistributed(ns, workers, WEAKEN_SCRIPT, weakenChunkThreads, [
         target,
         Date.now() + ns.getWeakenTime(target),
         ns.getWeakenTime(target),
         "prep-grow-weaken"
-      ], "weaken", "prep")) {
-        await ns.sleep(5_000);
+      ]);
+
+      if (!weakenResult.ok) {
+        ns.print(`prep post-grow weaken waiting for RAM required=${weakenResult.requested} available=${availableWeakenThreads}`);
+        await ns.sleep(PREP_WAIT_MS);
         continue;
       }
 
@@ -329,38 +412,28 @@ async function deployWorkers(ns, hosts) {
  * @param {string} script
  * @param {number} totalThreads
  * @param {Array<string | number>} args
- * @param {string} event
- * @param {string} batchId
- * @returns {boolean}
- */
-function launchDistributed(ns, workers, script, totalThreads, args, event, batchId) {
-  if (!canRunDistributed(ns, workers, script, totalThreads)) {
-    ns.print(`missed ${event} batch=${batchId} need=${Math.ceil(totalThreads)} available=${availableDistributedThreads(ns, workers, script)} scriptRam=${ns.getScriptRam(script, "home")}`);
-    return false;
-  }
-
-  const pids = runDistributed(ns, workers, script, totalThreads, args);
-  if (pids.length === 0) {
-    ns.print(`missed ${event} batch=${batchId} need=${Math.ceil(totalThreads)} available=${availableDistributedThreads(ns, workers, script)} scriptRam=${ns.getScriptRam(script, "home")}`);
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * @param {NS} ns
- * @param {string[]} workers
- * @param {string} script
- * @param {number} totalThreads
- * @param {Array<string | number>} args
- * @returns {number[]}
+ * @returns {{ ok: boolean, pids: number[], requested: number, launched: number }}
  */
 function runDistributed(ns, workers, script, totalThreads, args) {
-  let remaining = Math.ceil(totalThreads);
+  const requested = Math.max(0, Math.ceil(totalThreads));
   const pids = [];
-  const scriptRam = ns.getScriptRam(script, "home");
 
+  if (requested === 0) {
+    return { ok: true, pids, requested, launched: 0 };
+  }
+
+  const scriptRam = ns.getScriptRam(script, "home");
+  if (!Number.isFinite(scriptRam) || scriptRam <= 0) {
+    return { ok: false, pids, requested, launched: 0 };
+  }
+
+  if (!canRunDistributed(ns, workers, script, requested)) {
+    return { ok: false, pids, requested, launched: 0 };
+  }
+
+  let remaining = requested;
+  let launched = 0;
+  let failed = false;
   const sorted = [...workers].sort((a, b) => freeRam(ns, b) - freeRam(ns, a));
 
   for (const host of sorted) {
@@ -376,33 +449,26 @@ function runDistributed(ns, workers, script, totalThreads, args) {
     }
 
     const pid = ns.exec(script, host, threads, ...args);
-    if (pid !== 0) {
-      pids.push(pid);
-      remaining -= threads;
+    if (pid === 0) {
+      failed = true;
+      continue;
     }
+
+    pids.push(pid);
+    remaining -= threads;
+    launched += threads;
   }
 
-  return remaining === 0 ? pids : [];
-}
-
-/**
- * @param {NS} ns
- * @param {string[]} workers
- * @param {string} script
- * @returns {number}
- */
-function availableDistributedThreads(ns, workers, script) {
-  const scriptRam = ns.getScriptRam(script, "home");
-  if (!Number.isFinite(scriptRam) || scriptRam <= 0) {
-    return 0;
+  if (remaining > 0) {
+    failed = true;
   }
 
-  let available = 0;
-  for (const host of workers) {
-    available += Math.floor(freeRam(ns, host) / scriptRam);
-  }
-
-  return available;
+  return {
+    ok: !failed && launched === requested,
+    pids,
+    requested,
+    launched
+  };
 }
 
 /**
@@ -410,20 +476,69 @@ function availableDistributedThreads(ns, workers, script) {
  * @param {string[]} workers
  * @param {string} script
  * @param {number} totalThreads
- * @returns {boolean}
  */
 function canRunDistributed(ns, workers, script, totalThreads) {
-  return availableDistributedThreads(ns, workers, script) >= totalThreads;
+  const requested = Math.max(0, Math.ceil(totalThreads));
+  if (requested === 0) {
+    return true;
+  }
+
+  const scriptRam = ns.getScriptRam(script, "home");
+  if (!Number.isFinite(scriptRam) || scriptRam <= 0) {
+    return false;
+  }
+
+  return availableDistributedThreads(ns, workers, script) >= requested;
+}
+
+/**
+ * @param {NS} ns
+ * @param {string[]} workers
+ * @param {string} script
+ */
+function availableDistributedThreads(ns, workers, script) {
+  const scriptRam = ns.getScriptRam(script, "home");
+  if (!Number.isFinite(scriptRam) || scriptRam <= 0) {
+    return 0;
+  }
+
+  return workers.reduce((total, host) => total + Math.floor(freeRam(ns, host) / scriptRam), 0);
 }
 
 /**
  * @param {number[]} finishTimes
+ * @param {number} now
  */
-function pruneFinished(finishTimes) {
-  const now = Date.now();
-  while (finishTimes.length > 0 && finishTimes[0] <= now) {
-    finishTimes.shift();
+function pruneFinishedBatchFinishes(finishTimes, now) {
+  let writeIndex = 0;
+
+  for (const finishAt of finishTimes) {
+    if (finishAt > now) {
+      finishTimes[writeIndex++] = finishAt;
+    }
   }
+
+  finishTimes.length = writeIndex;
+}
+
+/**
+ * @param {number} batchId
+ */
+function shouldLogBatchStatus(batchId) {
+  return batchId < BATCH_STATUS_EARLY_COUNT || batchId % BATCH_STATUS_INTERVAL === 0;
+}
+
+/**
+ * @param {NS} ns
+ * @param {string} target
+ */
+function formatMoneyPercent(ns, target) {
+  const maxMoney = ns.getServerMaxMoney(target);
+  if (!Number.isFinite(maxMoney) || maxMoney <= 0) {
+    return "0.0%";
+  }
+
+  return formatPercent(ns.getServerMoneyAvailable(target) / maxMoney);
 }
 
 /**
@@ -432,100 +547,6 @@ function pruneFinished(finishTimes) {
  */
 function freeRam(ns, host) {
   return ns.getServerMaxRam(host) - ns.getServerUsedRam(host);
-}
-
-/**
- * @param {NS} ns
- */
-function rootAvailableServers(ns) {
-  for (const host of getHosts(ns)) {
-    if (host === "home" || ns.hasRootAccess(host)) {
-      continue;
-    }
-
-    tryRootServer(ns, host);
-  }
-}
-
-/**
- * @param {NS} ns
- * @returns {string[]}
- */
-function getHosts(ns) {
-  const seen = new Set(["home"]);
-  const queue = ["home"];
-
-  while (queue.length > 0) {
-    const host = queue.shift();
-    if (!host) {
-      continue;
-    }
-
-    for (const next of ns.scan(host)) {
-      if (seen.has(next)) {
-        continue;
-      }
-
-      seen.add(next);
-      queue.push(next);
-    }
-  }
-
-  return [...seen];
-}
-
-/**
- * @param {NS} ns
- * @param {string} host
- */
-function tryRootServer(ns, host) {
-  try {
-    if (ns.fileExists("BruteSSH.exe", "home")) {
-      ns.brutessh(host);
-    }
-    if (ns.fileExists("FTPCrack.exe", "home")) {
-      ns.ftpcrack(host);
-    }
-    if (ns.fileExists("relaySMTP.exe", "home")) {
-      ns.relaysmtp(host);
-    }
-    if (ns.fileExists("HTTPWorm.exe", "home")) {
-      ns.httpworm(host);
-    }
-    if (ns.fileExists("SQLInject.exe", "home")) {
-      ns.sqlinject(host);
-    }
-
-    if (ns.getServerNumPortsRequired(host) <= countAvailablePortOpeners(ns)) {
-      ns.nuke(host);
-    }
-  } catch {
-    // Ignore failed rooting attempts and keep moving.
-  }
-}
-
-/**
- * @param {NS} ns
- * @returns {number}
- */
-function countAvailablePortOpeners(ns) {
-  let count = 0;
-  if (ns.fileExists("BruteSSH.exe", "home")) {
-    count += 1;
-  }
-  if (ns.fileExists("FTPCrack.exe", "home")) {
-    count += 1;
-  }
-  if (ns.fileExists("relaySMTP.exe", "home")) {
-    count += 1;
-  }
-  if (ns.fileExists("HTTPWorm.exe", "home")) {
-    count += 1;
-  }
-  if (ns.fileExists("SQLInject.exe", "home")) {
-    count += 1;
-  }
-  return count;
 }
 
 /**
@@ -545,7 +566,7 @@ function chooseTarget(ns, hosts) {
       const weakenTime = ns.getWeakenTime(host);
       const required = ns.getServerRequiredHackingLevel(host);
 
-      const levelPenalty = required > level / 2 ? 0.50 : 1;
+      const levelPenalty = required > level / 2 ? 0.5 : 1;
       const score = (maxMoney / Math.max(1, minSecurity)) / Math.max(1, weakenTime) * levelPenalty;
 
       return { host, score };
@@ -555,28 +576,81 @@ function chooseTarget(ns, hosts) {
   return candidates[0]?.host ?? "";
 }
 
-/**
- * @param {number} value
- * @returns {string}
- */
-function formatPercent(value) {
-  return `${(value * 100).toFixed(1)}%`;
+/** @param {NS} ns */
+function rootAvailableServers(ns) {
+  const cracks = [
+    ["BruteSSH.exe", ns.brutessh],
+    ["FTPCrack.exe", ns.ftpcrack],
+    ["relaySMTP.exe", ns.relaysmtp],
+    ["HTTPWorm.exe", ns.httpworm],
+    ["SQLInject.exe", ns.sqlinject]
+  ];
+
+  const availableCracks = cracks.filter(([file]) => ns.fileExists(String(file), "home"));
+
+  for (const host of getHosts(ns)) {
+    if (host === "home" || ns.hasRootAccess(host)) {
+      continue;
+    }
+
+    if (availableCracks.length < ns.getServerNumPortsRequired(host)) {
+      continue;
+    }
+
+    for (const [, fn] of availableCracks) {
+      try {
+        fn(host);
+      } catch {
+        // Ignore already-open or unavailable edge cases.
+      }
+    }
+
+    try {
+      ns.nuke(host);
+    } catch {
+      // Ignore failures. The next loop will retry.
+    }
+  }
 }
 
-/**
- * @param {number} value
- * @returns {string}
- */
-function formatFixed(value) {
-  return value.toFixed(2);
+/** @param {NS} ns */
+function getHosts(ns) {
+  const seen = new Set(["home"]);
+  const stack = ["home"];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+
+    for (const next of ns.scan(current)) {
+      if (seen.has(next)) {
+        continue;
+      }
+
+      seen.add(next);
+      stack.push(next);
+    }
+  }
+
+  return [...seen];
 }
 
 /**
  * @param {number} value
  * @param {number} min
  * @param {number} max
- * @returns {number}
  */
 function clamp(value, min, max) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+
   return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * @param {number} value
+ * @returns {string}
+ */
+function formatPercent(value) {
+  return `${(value * 100).toFixed(1)}%`;
 }

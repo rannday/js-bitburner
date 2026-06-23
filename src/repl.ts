@@ -1,5 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { dirname, extname, join, relative } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { BitburnerRemoteApi } from "./bitburner.js";
 
@@ -19,8 +19,29 @@ const helpText = [
   "  all-metadata [server]",
   "  ram <server> <filename>",
   "  defs [local-path]",
-  "  save <local-path>"
+  "  save <local-path>",
+  "  clean [server]",
+  "  sync <server> <local-dir> [remote-dir] [--clean]"
 ].join("\n");
+
+const cleanupFilePaths = new Set([
+  "money.js",
+  "worker.js",
+  "scripts/worm.js",
+  "scripts/director.js",
+  "scripts/manager.js",
+  "scripts/tinyhack.js",
+  "scripts/tinygrow.js",
+  "scripts/tinyweaken.js",
+  "scripts/hacking/jit-batcher.js",
+  "scripts/hacking/jit-hack.js",
+  "scripts/hacking/jit-grow.js",
+  "scripts/hacking/jit-weaken.js",
+  "scripts/util/cleanup.js"
+]);
+
+const processCleanupNote =
+  "Remote API cannot kill running scripts. Run scripts/util/cleanup.js in-game for process cleanup.";
 
 export class UsageError extends Error {
   constructor(message: string) {
@@ -247,6 +268,48 @@ export async function executeCommand(
       return;
     }
 
+    case "clean": {
+      if (args.length > 1) {
+        throw new UsageError("clean accepts at most one optional server");
+      }
+
+      await cleanRemoteFiles(api, args[0], io);
+      return;
+    }
+
+    case "sync": {
+      const { server, localDir, remoteDir, clean } = parseSyncArgs(args);
+
+      if (clean) {
+        io.stdout(`${processCleanupNote}\n`);
+        await cleanRemoteFiles(api, undefined, io);
+      }
+
+      const files = await listUploadFiles(localDir);
+
+      if (files.length === 0) {
+        io.stdout(`No uploadable files found in ${localDir}\n`);
+        return;
+      }
+
+      const remotePrefix = remoteDir ? trimSlashes(remoteDir) : "";
+      let synced = 0;
+
+      for (const filePath of files) {
+        const content = await readFile(filePath, "utf8");
+        const localRelative = toBitburnerPath(join(localDir, relative(localDir, filePath)));
+        const remoteRelative = toBitburnerPath(relative(localDir, filePath));
+        const remoteFilename = remotePrefix ? `${remotePrefix}/${remoteRelative}` : remoteRelative;
+
+        await api.pushFile(remoteFilename, content, server);
+        io.stdout(`OK ${localRelative} -> ${server}:${remoteFilename}\n`);
+        synced += 1;
+      }
+
+      io.stdout(`Synced ${synced} file(s).\n`);
+      return;
+    }
+
     default:
       io.stdout('Unknown command. Type "help" for commands.\n');
   }
@@ -310,6 +373,86 @@ export function parseCommandLine(line: string): string[] {
   return tokens;
 }
 
+function parseSyncArgs(args: string[]): {
+  server: string;
+  localDir: string;
+  remoteDir: string | null;
+  clean: boolean;
+} {
+  const positional: string[] = [];
+  let clean = false;
+
+  for (const arg of args) {
+    if (arg === "--clean") {
+      if (clean) {
+        throw new UsageError("sync accepts --clean at most once");
+      }
+
+      clean = true;
+      continue;
+    }
+
+    if (arg.startsWith("--")) {
+      throw new UsageError("sync only supports --clean as an optional flag");
+    }
+
+    positional.push(arg);
+  }
+
+  if (positional.length < 2 || positional.length > 3) {
+    throw new UsageError("sync requires <server> <local-dir> [remote-dir]");
+  }
+
+  return {
+    server: positional[0],
+    localDir: positional[1],
+    remoteDir: positional[2] ?? null,
+    clean
+  };
+}
+
+async function cleanRemoteFiles(api: BitburnerRemoteApi, serverName: string | undefined, io: CommandIO): Promise<void> {
+  const servers = await api.getAllServers();
+  const selectedServers = serverName ? servers.filter((server) => server.hostname === serverName) : servers;
+
+  if (serverName && selectedServers.length === 0) {
+    io.stdout(`No known server named ${serverName}.\n`);
+    return;
+  }
+
+  let cleanedServers = 0;
+  let deletedFiles = 0;
+
+  for (const server of selectedServers) {
+    if (!server.hasAdminRights) {
+      continue;
+    }
+
+    const files = await api.getFileNames(server.hostname);
+    const staleFiles = files.filter((file) => cleanupFilePaths.has(file));
+
+    if (staleFiles.length === 0) {
+      continue;
+    }
+
+    cleanedServers += 1;
+
+    for (const file of staleFiles) {
+      await api.deleteFile(file, server.hostname);
+      io.stdout(`deleted ${server.hostname}:${file}\n`);
+      deletedFiles += 1;
+    }
+  }
+
+  if (deletedFiles === 0) {
+    io.stdout("No stale automation files found.\n");
+  } else {
+    io.stdout(`Cleaned ${deletedFiles} file(s) on ${cleanedServers} server(s).\n`);
+  }
+
+  io.stdout(`${processCleanupNote}\n`);
+}
+
 async function writeTextFile(path: string, content: string): Promise<void> {
   const parent = dirname(path);
 
@@ -322,4 +465,48 @@ async function writeTextFile(path: string, content: string): Promise<void> {
 
 async function writeJsonFile(path: string, value: unknown): Promise<void> {
   await writeTextFile(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function listUploadFiles(root: string): Promise<string[]> {
+  const results: string[] = [];
+  await walkUploadFiles(root, results);
+  results.sort((left, right) => left.localeCompare(right));
+  return results;
+}
+
+async function walkUploadFiles(currentPath: string, results: string[]): Promise<void> {
+  const entries = await readdir(currentPath, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const fullPath = join(currentPath, entry.name);
+    if (entry.isDirectory()) {
+      await walkUploadFiles(fullPath, results);
+      continue;
+    }
+
+    if (entry.isFile() && isUploadableFile(entry.name)) {
+      results.push(fullPath);
+    }
+  }
+}
+
+function isUploadableFile(filePath: string): boolean {
+  switch (extname(filePath).toLowerCase()) {
+    case ".js":
+    case ".ts":
+    case ".txt":
+    case ".script":
+    case ".json":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function toBitburnerPath(filePath: string): string {
+  return filePath.split(/[\\/]/u).join("/");
+}
+
+function trimSlashes(value: string): string {
+  return value.replace(/^[/\\]+|[/\\]+$/gu, "");
 }
