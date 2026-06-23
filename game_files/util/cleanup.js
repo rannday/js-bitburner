@@ -30,7 +30,13 @@ const FILE_PATHS = new Set([
   "scripts/util/cleanup.js"
 ]);
 
-const SCRIPT_PATH = "scripts/util/cleanup.js";
+const PROTECTED_HOME_FILE_PATHS = new Set([
+  "scripts/hacking/jit-batcher.js",
+  "scripts/hacking/jit-hack.js",
+  "scripts/hacking/jit-grow.js",
+  "scripts/hacking/jit-weaken.js",
+  "scripts/util/cleanup.js"
+]);
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -38,7 +44,7 @@ export async function main(ns) {
 
   const options = parseArgs(ns.args);
   if (!options) {
-    ns.tprint("Usage: run scripts/util/cleanup.js [--files] [--dry-run] [--target <hostname>]");
+    ns.tprint("Usage: run scripts/util/cleanup.js [--files] [--include-home-files] [--dry-run] [--target <hostname>]");
     return;
   }
 
@@ -81,7 +87,8 @@ export async function main(ns) {
     }
 
     for (const file of FILE_PATHS) {
-      if (host === ns.getHostname() && file === SCRIPT_PATH) {
+      if (host === "home" && PROTECTED_HOME_FILE_PATHS.has(file) && !options.includeHomeFiles) {
+        ns.tprint(`${options.dryRun ? "would skip" : "skip"} protected home:${file}`);
         continue;
       }
 
@@ -149,6 +156,7 @@ function shouldKillProcess(process, selfPid) {
  */
 function parseArgs(args) {
   let files = false;
+  let includeHomeFiles = false;
   let dryRun = false;
   let target = null;
 
@@ -157,6 +165,11 @@ function parseArgs(args) {
 
     if (value === "--files") {
       files = true;
+      continue;
+    }
+
+    if (value === "--include-home-files") {
+      includeHomeFiles = true;
       continue;
     }
 
@@ -180,6 +193,7 @@ function parseArgs(args) {
 
   return {
     files,
+    includeHomeFiles,
     dryRun,
     target
   };

@@ -106,8 +106,10 @@ async function runJit(ns, target, workers, plan, spacing, hackFraction) {
       }
 
       const currentBatch = batchId++;
-      if (shouldLogBatchStatus(currentBatch)) {
+      if (currentBatch < BATCH_STATUS_EARLY_COUNT) {
         ns.print(`plan batch=${currentBatch} hack=0ms weaken-hack=${spacing}ms grow=${spacing * 2}ms weaken-grow=${spacing * 3}ms`);
+      }
+      if (currentBatch < BATCH_STATUS_EARLY_COUNT || currentBatch % BATCH_STATUS_INTERVAL === 0) {
         ns.print(
           `batch=${currentBatch} money=${formatMoneyPercent(ns, target)} sec=${security.toFixed(2)}/${minSecurity.toFixed(2)} hackFraction=${formatPercent(hackFraction)}`
         );
@@ -519,13 +521,6 @@ function pruneFinishedBatchFinishes(finishTimes, now) {
   }
 
   finishTimes.length = writeIndex;
-}
-
-/**
- * @param {number} batchId
- */
-function shouldLogBatchStatus(batchId) {
-  return batchId < BATCH_STATUS_EARLY_COUNT || batchId % BATCH_STATUS_INTERVAL === 0;
 }
 
 /**
