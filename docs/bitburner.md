@@ -6,3 +6,5 @@
   * [Hacking](https://github.com/bitburner-official/bitburner-src/blob/dev/src/Documentation/doc/en/basic/hacking.md)
   * [Hacking Algorithms](https://github.com/bitburner-official/bitburner-src/blob/dev/src/Documentation/doc/en/programming/hackingalgorithms.md)
 * [Remote API Docs](https://github.com/bitburner-official/bitburner-src/blob/dev/src/Documentation/doc/en/programming/remote_api.md)
+* [Netscript API Docs](https://github.com/bitburner-official/bitburner-src/blob/dev/markdown/bitburner.md)
+  * [Netscript Definitions](https://github.com/bitburner-official/bitburner-src/blob/dev/src/ScriptEditor/NetscriptDefinitions.d.ts)

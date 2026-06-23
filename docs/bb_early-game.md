@@ -1,5 +1,7 @@
 # Bitburner Early Game
 
+You only get 8GB of RAM at the start of the game. So keep things simple until you get 64+GB of RAM on your home machine.
+
 ## TOR Router
 At $200k, buy a TOR router
 ```bash

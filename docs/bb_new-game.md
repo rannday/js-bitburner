@@ -24,6 +24,14 @@ When starting out, hacking is the most profitable way to earn money and progress
 
 ```
 
+Starting RAM  
+```bash
+[home /]> free
+Total:     8.00GB
+Used:      0.00GB (0.00%)
+Available: 8.00GB
+```
+
 ## Help
 ```bash
 [home /]> help
